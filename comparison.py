@@ -2,9 +2,11 @@ import requests
 import pandas as pd
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
+import mysql.connector
+from mysql.connector import Error
 import os
 
-def get_stock_data(ticker, api_key, months_back=6):
+def get_stock_data(ticker, api_key, months_back=86):
     """Fetch and process historical stock data from Alpha Vantage"""
     end_date = datetime.today()
     start_date = end_date - timedelta(days=30*months_back)
@@ -45,6 +47,66 @@ def get_stock_data(ticker, api_key, months_back=6):
         print(f"Error fetching {ticker}: {str(e)}")
         return None
 
+def upload_to_rds_per_service(df, ticker, host, user, password, port=3306):
+    """Upload DataFrame to the proper AWS RDS MySQL database per service"""
+    # Map ticker to database
+    ticker_db_map = {
+        'SPOT': 'spotify_service',
+        'SIRI': 'siriusxm_service'
+    }
+    
+    database = ticker_db_map.get(ticker)
+    if not database:
+        print(f"No database mapped for ticker {ticker}")
+        return
+    
+    try:
+        # Connect to the corresponding database
+        connection = mysql.connector.connect(
+            host=host,
+            user=user,
+            password=password,
+            database=database,
+            port=port
+        )
+
+        if connection.is_connected():
+            cursor = connection.cursor()
+            print(f"Connected to {database} at {host}")
+
+            # Insert or update rows into stock_data table
+            for index, row in df.iterrows():
+                insert_query = """
+                INSERT INTO stock_data (date, open, high, low, close, volume, ticker)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE 
+                    open=VALUES(open),
+                    high=VALUES(high),
+                    low=VALUES(low),
+                    close=VALUES(close),
+                    volume=VALUES(volume),
+                    ticker=VALUES(ticker)
+                """
+                cursor.execute(insert_query, (
+                    index.date(), 
+                    row['Open'], 
+                    row['High'], 
+                    row['Low'], 
+                    row['Close'], 
+                    int(row['Volume']), 
+                    row['Ticker']
+                ))
+
+            connection.commit()
+            print(f"Uploaded {len(df)} records to {database}.stock_data")
+
+    except Error as e:
+        print(f"Error connecting to MySQL: {e}")
+    finally:
+        if connection.is_connected():
+            cursor.close()
+            connection.close()
+            print("MySQL connection closed")
 
 def save_to_csv(df, ticker):
     """Save DataFrame to CSV with standardized filename"""
@@ -98,13 +160,23 @@ TICKERS = ['SPOT', 'SIRI']
 
 # Main execution
 if __name__ == "__main__":
+    # AWS RDS Config
+    RDS_CONFIG = {
+        'host': 'spotifyvssiriusxm.cevge02u6cv8.us-east-1.rds.amazonaws.com',
+        'user': 'admin',
+        'password': 'Jdawg123',
+        'port': 3306  # default MySQL port
+    }
+
     # Fetch data for both companies
     dataframes = {}
     for ticker in TICKERS:
         df = get_stock_data(ticker, API_KEY)
         if df is not None:
-            save_to_csv(df, ticker)
+            save_to_csv(df, ticker)  # Save to CSV
+            upload_to_rds_per_service(df, ticker, **RDS_CONFIG)  # Upload to RDS
             dataframes[ticker] = df
+
     
     if len(dataframes) == 2:
         # Perform comparison analysis
